@@ -1,0 +1,7 @@
+# your logged-in browser session, never commit this
+browser-profile/
+config.yaml
+screenshots/
+__pycache__/
+.pytest_cache/
+.venv/

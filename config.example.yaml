@@ -1,0 +1,33 @@
+# Copy this file to config.yaml and edit it. config.yaml is git-ignored.
+
+interval_seconds: 30   # how often each page is reloaded, minimum 10
+jitter_seconds: 5      # random extra wait so reloads are not perfectly regular
+hold_minutes: 10       # after an alert, wait this long before checking that match again
+headless: false        # keep false so the window is there for you to buy in
+
+# If the page URL contains any of these, you are in the site's waiting room.
+# The bot alerts you and then leaves that tab alone (refreshing loses your place).
+queue_url_markers:
+  - queue-it
+
+notify:
+  # Install the ntfy app (Android / iOS), subscribe to a topic name nobody can guess,
+  # and put the same name here. Leave empty for terminal beeps only.
+  ntfy_topic: ""
+  sound: true
+
+watches:
+  - name: Chelsea v Arsenal
+    # Open the match's ticket page while logged in and copy the link from the address bar.
+    url: PASTE_THE_MATCH_TICKET_PAGE_LINK_HERE
+
+    # Pick exactly ONE way to recognise "tickets available", then confirm it with
+    # `python ticket_watch.py test` while the match is sold out:
+    available_when:
+      text_absent: ["sold out"]        # available when none of these phrases are on the page
+      # text: ["add to basket"]        # available when any of these phrases appear
+      # selector: "button.buy-tickets" # available when this CSS element is visible
+
+    # Optional: phrases that only show when you have been logged out.
+    # logged_out_when:
+    #   text: ["sign in to continue"]
