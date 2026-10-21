@@ -31,3 +31,12 @@ watches:
     # Optional: phrases that only show when you have been logged out.
     # logged_out_when:
     #   text: ["sign in to continue"]
+
+    # Optional: the clicks that put tickets in your basket. Done once per match per run,
+    # then you pay yourself. Get these with `python ticket_watch.py record` (see README).
+    # Anything that looks like a pay or checkout button is refused.
+    # basket_steps:
+    #   - click: 'text=Matthew Harding Lower'
+    #   - select: {selector: "#quantity", value: "2"}
+    #   - click: 'role=button[name="Add to basket"]'
+    #   - wait_for: 'text=added to your basket'

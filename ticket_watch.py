@@ -2,12 +2,12 @@
 """Ticket availability watcher.
 
 Reloads ticket pages you are logged in to at a polite interval and alerts you
-(phone push via ntfy, terminal beep) the moment tickets look available, so you
-can buy them yourself in the browser window it already has open.
+(phone push via ntfy, terminal beep) the moment tickets look available. If you
+recorded basket steps, it clicks through them once to put tickets in your
+basket, then you pay yourself in the browser window it already has open.
 
-It deliberately never clicks "buy", never solves CAPTCHAs and never skips or
-refreshes queues: club ticketing terms ban automated purchasing, and clubs
-cancel memberships caught doing it.
+It deliberately never pays or checks out, never solves CAPTCHAs and never
+skips or refreshes queues.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import argparse
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -37,7 +38,14 @@ DEFAULT_INTERVAL_SECONDS = 30
 QUEUE_POLL_SECONDS = 5
 LOGGED_OUT_RECHECK_SECONDS = 120
 MAX_BACKOFF_SECONDS = 15 * 60
+STEP_TIMEOUT_MS = 15_000
 CONDITION_KEYS = ("selector", "text", "text_absent")
+STEP_KINDS = ("click", "select", "wait_for")
+# Basket steps must stop before payment, so refuse anything that looks like a checkout button.
+PAYMENT_RE = re.compile(
+    r"\b(pay|payment|pay now|checkout|check out|place order|complete purchase|confirm purchase|confirm order)\b",
+    re.IGNORECASE,
+)
 
 
 def log(msg: str) -> None:
@@ -57,12 +65,21 @@ def first_line(err: Exception) -> str:
 
 
 @dataclass
+class Step:
+    kind: str  # one of STEP_KINDS
+    selector: str
+    value: str | None = None  # option to pick, for "select" steps
+
+
+@dataclass
 class Watch:
     name: str
     url: str
     condition: str  # one of CONDITION_KEYS
     condition_value: str | list[str]
     logged_out_text: list[str] = field(default_factory=list)
+    basket_steps: list[Step] = field(default_factory=list)
+    basket_tried: bool = False
     state: str = "new"
     next_check: float = 0.0
     failures: int = 0
@@ -88,6 +105,31 @@ class Result:
     state: str  # available | unavailable | queued | logged_out | blocked | error
     detail: str
     status: int | None = None
+
+
+def parse_steps(name: str, raw_steps) -> list[Step]:
+    steps = []
+    for i, raw in enumerate(raw_steps or [], start=1):
+        kinds = [k for k in STEP_KINDS if k in raw] if isinstance(raw, dict) else []
+        if len(kinds) != 1:
+            sys.exit(f"Watch '{name}': basket step {i} needs exactly one of {', '.join(STEP_KINDS)}.")
+        kind = kinds[0]
+        if kind == "select":
+            opts = raw["select"] if isinstance(raw["select"], dict) else {}
+            step = Step(kind, str(opts.get("selector") or ""), str(opts.get("value") or ""))
+            if not step.selector or not step.value:
+                sys.exit(f"Watch '{name}': basket step {i} select needs both selector and value.")
+        else:
+            step = Step(kind, str(raw[kind] or ""))
+            if not step.selector:
+                sys.exit(f"Watch '{name}': basket step {i} has an empty selector.")
+        if PAYMENT_RE.search(step.selector):
+            sys.exit(
+                f"Watch '{name}': basket step {i} ({step.selector!r}) looks like a payment or checkout step. "
+                "The bot only fills the basket, you pay yourself."
+            )
+        steps.append(step)
+    return steps
 
 
 def load_config(path: Path) -> Config:
@@ -117,7 +159,7 @@ def load_config(path: Path) -> Config:
         key = keys[0]
         value = str(cond[key]) if key == "selector" else as_list(cond[key])
         logged_out = as_list((w.get("logged_out_when") or {}).get("text"))
-        watches.append(Watch(name, url, key, value, logged_out))
+        watches.append(Watch(name, url, key, value, logged_out, parse_steps(name, w.get("basket_steps"))))
     if not watches:
         sys.exit(f"No watches configured in {path}.")
 
@@ -231,6 +273,21 @@ def check(watch: Watch, page, cfg: Config) -> Result:
     return Result("available" if available else "unavailable", detail, status)
 
 
+def fill_basket(watch: Watch, page) -> tuple[bool, str]:
+    for i, step in enumerate(watch.basket_steps, start=1):
+        loc = page.locator(step.selector).first
+        try:
+            if step.kind == "click":
+                loc.click(timeout=STEP_TIMEOUT_MS)
+            elif step.kind == "select":
+                loc.select_option(step.value, timeout=STEP_TIMEOUT_MS)
+            else:
+                loc.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+        except PlaywrightError as e:
+            return False, f"step {i} ({step.kind} {step.selector!r}) failed: {first_line(e)}"
+    return True, f"all {len(watch.basket_steps)} steps done"
+
+
 def save_screenshot(page, watch: Watch, directory: Path) -> Path | None:
     directory.mkdir(parents=True, exist_ok=True)
     slug = re.sub(r"[^a-z0-9]+", "-", watch.name.lower()).strip("-") or "watch"
@@ -257,14 +314,24 @@ def react(watch: Watch, result: Result, cfg: Config, notifier: Notifier, now: fl
 
     if result.state == "available":
         watch.failures = 0
-        save_screenshot(watch.page, watch, cfg.screenshot_dir)
         bring_to_front(watch.page)
-        notifier.send(
-            f"TICKETS: {watch.name}",
-            f"Looks available ({result.detail}). Buy now in the bot's browser window.",
-            watch.url,
-            urgent=True,
-        )
+        if watch.basket_steps and not watch.basket_tried:
+            # Only one attempt per match per run, so it can never keep piling tickets into the basket.
+            watch.basket_tried = True
+            notifier.send(f"TICKETS: {watch.name}", "Looks available, filling your basket now.", watch.url, urgent=True)
+            ok, detail = fill_basket(watch, watch.page)
+            log(f"{watch.name}: basket {'filled' if ok else 'not filled'} ({detail})")
+            if ok:
+                title, message = f"IN BASKET: {watch.name}", "Pay now in the bot's browser window before the hold runs out."
+            else:
+                title, message = (
+                    f"FINISH IT YOURSELF: {watch.name}",
+                    f"Filling the basket failed, {detail}. If there is a robot check, solve it in the bot's window.",
+                )
+        else:
+            title, message = f"TICKETS: {watch.name}", f"Looks available ({result.detail}). Buy now in the bot's window."
+        save_screenshot(watch.page, watch, cfg.screenshot_dir)
+        notifier.send(title, message, watch.url, urgent=True)
         # Hand this tab over to you: it is never reloaded again, later checks use a new tab.
         watch.page = None
         watch.next_check = now + cfg.hold_minutes * 60
@@ -350,6 +417,34 @@ def run_test(cfg: Config, profile_dir: Path = PROFILE_DIR) -> None:
             context.close()
 
 
+def run_test_basket(cfg: Config, profile_dir: Path = PROFILE_DIR) -> None:
+    watch = next((w for w in cfg.watches if w.basket_steps), None)
+    if watch is None:
+        sys.exit("No watch has basket_steps in the config.")
+    with sync_playwright() as p:
+        context = open_browser(p, headless=False, profile_dir=profile_dir)
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            page.goto(watch.url, wait_until="domcontentloaded", timeout=45_000)
+            ok, detail = fill_basket(watch, page)
+            log(f"{watch.name}: basket {'filled' if ok else 'not filled'} ({detail})")
+            input("Check the window (empty the basket if you don't want them), then press Enter to close... ")
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+
+def run_record(url: str, profile_dir: Path = PROFILE_DIR) -> None:
+    log("Click through to 'Add to basket' in the window that opens. Each click shows up as code in the "
+        "Playwright Inspector window, copy it into basket_steps (the README shows how).")
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "codegen", "--target=python", f"--user-data-dir={profile_dir}", url],
+        check=False,
+    )
+
+
 def run_login(url: str, profile_dir: Path = PROFILE_DIR) -> None:
     with sync_playwright() as p:
         context = open_browser(p, headless=False, profile_dir=profile_dir)
@@ -366,7 +461,10 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     login = sub.add_parser("login", help="open the browser so you can log in once, the session is kept")
     login.add_argument("--url", help="page to open, defaults to the first watch url")
+    record = sub.add_parser("record", help="record your clicks to 'Add to basket' as code for basket_steps")
+    record.add_argument("--url", help="page to start on, defaults to the first watch url")
     sub.add_parser("test", help="check every watch once and print what the bot sees")
+    sub.add_parser("test-basket", help="run the basket steps once right now, to check they work")
     sub.add_parser("test-notify", help="send a test alert to your phone")
     sub.add_parser("watch", help="keep checking and alert you when tickets appear")
     args = parser.parse_args()
@@ -374,8 +472,12 @@ def main() -> None:
     cfg = load_config(Path(args.config))
     if args.command == "login":
         run_login(args.url or cfg.watches[0].url)
+    elif args.command == "record":
+        run_record(args.url or cfg.watches[0].url)
     elif args.command == "test":
         run_test(cfg)
+    elif args.command == "test-basket":
+        run_test_basket(cfg)
     elif args.command == "test-notify":
         Notifier(cfg).send("Ticket bot test", "If you can read this on your phone, alerts work.", urgent=True)
         if not cfg.ntfy_topic:

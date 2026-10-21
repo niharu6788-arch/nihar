@@ -16,7 +16,23 @@ PAGES = {
     "/logged-out": (200, "<h1>Please sign in to your account to continue</h1>"),
     "/rate-limited": (429, "<p>Too many requests, please slow down and try later.</p>"),
     "/queue-it/wait": (200, "<p>You are now in the queue. Please wait for your turn.</p>"),
+    "/basket-flow": (
+        200,
+        "<h1>Chelsea v Test FC</h1><p>Seats on sale now.</p>"
+        "<a href='#' onclick=\"document.getElementById('seats').style.display='block'\">Matthew Harding Lower</a>"
+        "<div id='seats' style='display:none'>"
+        "<select id='qty'><option value='1'>1</option><option value='2'>2</option></select>"
+        "<button onclick=\"document.getElementById('basket').textContent="
+        "'Added to basket: ' + document.getElementById('qty').value\">Add to basket</button></div>"
+        "<p id='basket'></p>",
+    ),
 }
+BASKET_STEPS = [
+    tw.Step("click", "text=Matthew Harding Lower"),
+    tw.Step("select", "#qty", "2"),
+    tw.Step("click", 'role=button[name="Add to basket"]'),
+    tw.Step("wait_for", "text=Added to basket: 2"),
+]
 HITS = []
 
 
@@ -133,6 +149,66 @@ def test_available_hands_tab_over(page, base_url, tmp_path):
     assert watch.next_check == 1000 + cfg.hold_minutes * 60
     assert notifier.sent == [("TICKETS: Test match", True)]
     assert list(tmp_path.glob("*.png"))
+
+
+def test_basket_filled_once(browser, page, base_url, tmp_path):
+    watch = make_watch(base_url + "/basket-flow")
+    watch.basket_steps = BASKET_STEPS
+    cfg = make_cfg(watch, tmp_path)
+    watch.page = page
+    notifier = FakeNotifier()
+    tw.react(watch, tw.check(watch, page, cfg), cfg, notifier)
+    assert page.inner_text("#basket") == "Added to basket: 2"
+    assert [title for title, _ in notifier.sent] == ["TICKETS: Test match", "IN BASKET: Test match"]
+
+    # Later availability only alerts, it never adds more tickets.
+    watch.page = page = browser.new_page()
+    tw.react(watch, tw.check(watch, page, cfg), cfg, notifier)
+    assert page.inner_text("#basket") == ""
+    assert notifier.sent[-1][0] == "TICKETS: Test match"
+    page.close()
+
+
+def test_basket_filled_after_queue(page, base_url, tmp_path):
+    watch = make_watch(base_url + "/to-queue")
+    watch.basket_steps = BASKET_STEPS
+    cfg = make_cfg(watch, tmp_path)
+    watch.page = page
+    notifier = FakeNotifier()
+    tw.react(watch, tw.check(watch, page, cfg), cfg, notifier)
+    assert watch.state == "queued"
+    page.goto(base_url + "/basket-flow")  # the site lets you through when it is your turn
+    hits_before = len(HITS)
+    tw.react(watch, tw.check(watch, page, cfg), cfg, notifier)
+    assert len(HITS) == hits_before  # it used the page the queue sent you to, no reload
+    assert page.inner_text("#basket") == "Added to basket: 2"
+
+
+def test_basket_failure_tells_you(page, base_url, tmp_path, monkeypatch):
+    monkeypatch.setattr(tw, "STEP_TIMEOUT_MS", 1000)
+    watch = make_watch(base_url + "/basket-flow")
+    watch.basket_steps = [tw.Step("click", "text=Stand that does not exist")]
+    cfg = make_cfg(watch, tmp_path)
+    watch.page = page
+    notifier = FakeNotifier()
+    tw.react(watch, tw.check(watch, page, cfg), cfg, notifier)
+    assert notifier.sent[-1][0] == "FINISH IT YOURSELF: Test match"
+
+
+def test_config_refuses_payment_steps(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "watches:\n"
+        "  - name: Test\n"
+        "    url: https://example.com\n"
+        "    available_when:\n"
+        "      text_absent: Sold out\n"
+        "    basket_steps:\n"
+        "      - click: 'text=Add to basket'\n"
+        "      - click: 'role=button[name=\"Pay now\"]'\n"
+    )
+    with pytest.raises(SystemExit, match="payment or checkout"):
+        tw.load_config(path)
 
 
 def test_blocked_backs_off(tmp_path):
